@@ -1,0 +1,45 @@
+{
+  "general": {
+    "start_minimized": true,
+    "start_with_windows": false,
+    "language": "uk"
+  },
+  "hotkeys": {
+    "push_to_talk": "ctrl+shift+space",
+    "toggle_language": "ctrl+shift+l",
+    "open_settings": "ctrl+shift+comma",
+    "open_history": "ctrl+shift+h"
+  },
+  "audio": {
+    "input_device": null,
+    "sample_rate": 16000,
+    "channels": 1,
+    "silence_threshold": 0.01,
+    "silence_duration_ms": 500
+  },
+  "transcription": {
+    "model_size": "base",
+    "device": "auto",
+    "compute_type": "int8",
+    "beam_size": 5,
+    "vad_filter": true,
+    "word_timestamps": false,
+    "initial_prompt": null
+  },
+  "output": {
+    "insert_method": "clipboard",
+    "add_trailing_space": true,
+    "capitalize_sentences": true,
+    "preserve_clipboard": true
+  },
+  "history": {
+    "enabled": true,
+    "max_entries": 1000,
+    "save_audio": false
+  },
+  "ui": {
+    "theme": "system",
+    "show_status_indicator": true,
+    "notification_on_complete": false
+  }
+}

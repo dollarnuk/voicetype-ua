@@ -1,0 +1,24 @@
+# VoiceType UA - Dependencies
+# Python 3.11+ required
+
+# Core STT Engine
+faster-whisper>=1.0.0
+ctranslate2>=4.0.0
+
+# Audio Processing
+sounddevice>=0.4.6
+numpy>=1.24.0,<2.0.0
+
+# GUI Framework
+PyQt6>=6.6.0
+
+# Input/Output
+pynput>=1.7.6
+pyperclip>=1.8.2
+
+# Logging
+loguru>=0.7.0
+
+# Optional: GPU acceleration (uncomment if NVIDIA GPU available)
+# torch>=2.0.0
+# --extra-index-url https://download.pytorch.org/whl/cu121
