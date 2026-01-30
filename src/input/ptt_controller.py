@@ -2,6 +2,7 @@
 
 from typing import Callable, Optional, Set
 import threading
+import queue
 import time
 from loguru import logger
 
@@ -31,6 +32,9 @@ class PTTController:
     # Minimum time (seconds) to consider it a "hold" vs a "tap"
     MIN_HOLD_TIME = 0.15
 
+    # Debounce window in milliseconds
+    DEBOUNCE_MS = 100
+
     # Key mapping for comparison
     MODIFIER_KEYS = {
         Key.ctrl_l, Key.ctrl_r,
@@ -42,7 +46,7 @@ class PTTController:
         self,
         hotkey_manager: HotkeyManager,
         audio_capture: AudioCapture,
-        hotkey: str = "ctrl+shift+space",
+        hotkey: str = "ctrl+space",
     ):
         """Initialize PTT controller.
 
@@ -61,10 +65,24 @@ class PTTController:
         self._current_keys: Set = set()
         self._lock = threading.Lock()
 
+        # Debounce state to prevent rapid fire
+        self._last_activation_time: float = 0
+        self._combo_was_active: bool = False
+
         # Callbacks
         self._on_recording_start: Optional[Callable] = None
         self._on_recording_stop: Optional[Callable] = None
         self._on_transcription_ready: Optional[Callable] = None
+        self._on_streaming_text: Optional[Callable[[str], None]] = None
+
+        # Transcription queue (fixes thread accumulation issue)
+        self._transcription_queue: queue.Queue = queue.Queue()
+        self._worker_thread: Optional[threading.Thread] = None
+        self._worker_running = False
+
+        # Streaming mode
+        self._streaming_enabled: bool = False
+        self._streaming_text: str = ""  # Accumulated text during streaming
 
         # Parse hotkey
         self._parse_ptt_hotkey()
@@ -110,9 +128,15 @@ class PTTController:
         # Check if PTT combo is pressed
         if self._ptt_keys.issubset(self._current_keys):
             with self._lock:
-                if not self._is_active:
+                now = time.time()
+                # Only trigger if:
+                # 1. Combo was NOT already active (prevents re-trigger)
+                # 2. Debounce period has passed
+                if not self._combo_was_active and (now - self._last_activation_time) >= self.DEBOUNCE_MS / 1000:
+                    self._combo_was_active = True
+                    self._last_activation_time = now
                     self._is_active = True
-                    self._press_time = time.time()
+                    self._press_time = now
                     self._start_recording()
 
     def _on_key_release(self, key):
@@ -124,7 +148,8 @@ class PTTController:
         # Check if released key is part of PTT combo
         if normalized in self._ptt_keys:
             with self._lock:
-                if self._is_active:
+                # Only stop if combo was active and we're recording
+                if self._combo_was_active and self._is_active:
                     hold_time = time.time() - self._press_time if self._press_time else 0
 
                     if hold_time >= self.MIN_HOLD_TIME:
@@ -138,6 +163,9 @@ class PTTController:
                     self._is_active = False
                     self._press_time = None
 
+                # Reset combo active flag when ANY PTT key is released
+                self._combo_was_active = False
+
         self._current_keys.discard(normalized)
 
     def _start_recording(self):
@@ -145,6 +173,13 @@ class PTTController:
         logger.info("PTT: Recording started")
 
         try:
+            # Clear streaming state
+            self._streaming_text = ""
+
+            # Set streaming chunk callback if streaming enabled
+            if self._streaming_enabled:
+                self.audio_capture.set_chunk_callback(self._on_audio_chunk)
+
             self.audio_capture.start_recording()
 
             if self._on_recording_start:
@@ -153,6 +188,17 @@ class PTTController:
         except Exception as e:
             logger.error(f"Failed to start recording: {e}")
 
+    def _on_audio_chunk(self, audio_chunk):
+        """Handle streaming audio chunk.
+
+        Called by AudioCapture when a chunk is ready during recording.
+        """
+        if not self._streaming_enabled or not self._on_streaming_text:
+            return
+
+        # Put chunk in queue for processing
+        self._transcription_queue.put(("chunk", audio_chunk))
+
     def _stop_recording(self):
         """Stop recording and trigger transcription."""
         logger.info("PTT: Recording stopped")
@@ -160,17 +206,21 @@ class PTTController:
         try:
             audio_data = self.audio_capture.stop_recording()
 
+            # Clear chunk callback
+            self.audio_capture.set_chunk_callback(None)
+
             if self._on_recording_stop:
                 self._on_recording_stop()
 
-            # Trigger transcription callback
-            if self._on_transcription_ready and len(audio_data) > 0:
-                # Run in separate thread to not block
-                threading.Thread(
-                    target=self._on_transcription_ready,
-                    args=(audio_data,),
-                    daemon=True,
-                ).start()
+            # Queue for transcription
+            if self._streaming_enabled:
+                # In streaming mode, transcribe any remaining audio
+                if len(audio_data) > 0:
+                    self._transcription_queue.put(("final", audio_data))
+            else:
+                # Normal mode - transcribe full audio
+                if self._on_transcription_ready and len(audio_data) > 0:
+                    self._transcription_queue.put(("full", audio_data))
 
         except Exception as e:
             logger.error(f"Failed to stop recording: {e}")
@@ -194,6 +244,7 @@ class PTTController:
         on_recording_start: Optional[Callable] = None,
         on_recording_stop: Optional[Callable] = None,
         on_transcription_ready: Optional[Callable] = None,
+        on_streaming_text: Optional[Callable[[str], None]] = None,
     ):
         """Set PTT event callbacks.
 
@@ -201,13 +252,88 @@ class PTTController:
             on_recording_start: Called when recording starts
             on_recording_stop: Called when recording stops
             on_transcription_ready: Called with audio data when ready to transcribe
+            on_streaming_text: Called with partial text during streaming
         """
         self._on_recording_start = on_recording_start
         self._on_recording_stop = on_recording_stop
         self._on_transcription_ready = on_transcription_ready
+        self._on_streaming_text = on_streaming_text
+
+    def enable_streaming(self, enabled: bool = True):
+        """Enable or disable streaming transcription mode.
+
+        When enabled, text is inserted in real-time as you speak.
+
+        Args:
+            enabled: Whether to enable streaming
+        """
+        self._streaming_enabled = enabled
+        self.audio_capture.enable_streaming(enabled)
+        logger.info(f"Streaming mode {'enabled' if enabled else 'disabled'}")
+
+    def _transcription_worker(self):
+        """Worker thread that processes transcription queue."""
+        logger.info("Transcription worker started")
+        while self._worker_running:
+            try:
+                # Wait for audio data with timeout (allows checking _worker_running)
+                item = self._transcription_queue.get(timeout=0.5)
+                if item is None:
+                    self._transcription_queue.task_done()
+                    continue
+
+                # Handle different item types
+                if isinstance(item, tuple):
+                    item_type, audio_data = item
+
+                    if item_type == "chunk" and self._on_streaming_text:
+                        # Streaming chunk - call streaming callback
+                        try:
+                            self._on_streaming_text(audio_data, self._streaming_text)
+                        except Exception as e:
+                            logger.error(f"Streaming callback error: {e}")
+
+                    elif item_type == "final" and self._on_streaming_text:
+                        # Final chunk after release - signal completion
+                        try:
+                            self._on_streaming_text(audio_data, self._streaming_text, is_final=True)
+                        except Exception as e:
+                            logger.error(f"Final streaming callback error: {e}")
+                        # Clear streaming text
+                        self._streaming_text = ""
+
+                    elif item_type == "full" and self._on_transcription_ready:
+                        # Full audio (non-streaming mode)
+                        try:
+                            self._on_transcription_ready(audio_data)
+                        except Exception as e:
+                            logger.error(f"Transcription callback error: {e}")
+                else:
+                    # Legacy format - treat as full audio
+                    if self._on_transcription_ready:
+                        try:
+                            self._on_transcription_ready(item)
+                        except Exception as e:
+                            logger.error(f"Transcription callback error: {e}")
+
+                self._transcription_queue.task_done()
+            except queue.Empty:
+                continue
+            except Exception as e:
+                logger.error(f"Transcription worker error: {e}")
+        logger.info("Transcription worker stopped")
 
     def start(self):
         """Start PTT controller."""
+        # Start transcription worker thread
+        self._worker_running = True
+        self._worker_thread = threading.Thread(
+            target=self._transcription_worker,
+            daemon=True,
+            name="TranscriptionWorker",
+        )
+        self._worker_thread.start()
+
         # Set key callbacks on hotkey manager
         self.hotkey_manager.set_key_callbacks(
             on_press=self._on_key_press,
@@ -221,6 +347,11 @@ class PTTController:
 
     def stop(self):
         """Stop PTT controller."""
+        # Stop transcription worker
+        self._worker_running = False
+        if self._worker_thread and self._worker_thread.is_alive():
+            self._worker_thread.join(timeout=2.0)
+
         # Clear callbacks
         self.hotkey_manager.set_key_callbacks(None, None)
 

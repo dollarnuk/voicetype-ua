@@ -5,7 +5,7 @@
     "language": "uk"
   },
   "hotkeys": {
-    "push_to_talk": "ctrl+shift+space",
+    "push_to_talk": "ctrl+space",
     "toggle_language": "ctrl+shift+l",
     "open_settings": "ctrl+shift+comma",
     "open_history": "ctrl+shift+h"
@@ -18,13 +18,15 @@
     "silence_duration_ms": 500
   },
   "transcription": {
-    "model_size": "base",
-    "device": "auto",
+    "model_size": "small",
+    "device": "cuda",
     "compute_type": "int8",
-    "beam_size": 5,
+    "beam_size": 6,
     "vad_filter": true,
     "word_timestamps": false,
-    "initial_prompt": null
+    "initial_prompt": null,
+    "streaming": true,
+    "chunk_duration": 1.5
   },
   "output": {
     "insert_method": "clipboard",

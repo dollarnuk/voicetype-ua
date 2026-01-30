@@ -33,6 +33,7 @@ class AudioCapture:
         dtype: str = "float32",
         device: Optional[int] = None,
         blocksize: int = 1024,
+        chunk_duration: float = 1.5,  # Streaming chunk duration in seconds
     ):
         """Initialize audio capture.
 
@@ -42,6 +43,7 @@ class AudioCapture:
             dtype: Data type ('float32', 'int16')
             device: Input device index (None = default)
             blocksize: Samples per callback block
+            chunk_duration: Duration of streaming chunks in seconds
         """
         if not SOUNDDEVICE_AVAILABLE:
             raise RuntimeError("sounddevice not available")
@@ -51,6 +53,7 @@ class AudioCapture:
         self.dtype = dtype
         self.device = device
         self.blocksize = blocksize
+        self.chunk_duration = chunk_duration
 
         self._stream: Optional[sd.InputStream] = None
         self._audio_queue: queue.Queue = queue.Queue()
@@ -58,10 +61,17 @@ class AudioCapture:
         self._is_recording = False
         self._lock = threading.Lock()
 
+        # Streaming chunks
+        self._chunk_buffer: List[np.ndarray] = []
+        self._chunk_samples: int = 0
+        self._samples_per_chunk: int = int(sample_rate * chunk_duration)
+        self._streaming_enabled: bool = False
+
         # Callbacks
         self._on_audio_level: Optional[Callable[[float], None]] = None
+        self._on_chunk_ready: Optional[Callable[[np.ndarray], None]] = None
 
-        logger.info(f"AudioCapture initialized: {sample_rate}Hz, {channels}ch, {dtype}")
+        logger.info(f"AudioCapture initialized: {sample_rate}Hz, {channels}ch, {dtype}, chunk={chunk_duration}s")
 
     def _audio_callback(
         self,
@@ -87,6 +97,30 @@ class AudioCapture:
                 level = np.abs(audio_chunk).mean()
                 self._on_audio_level(level)
 
+            # Streaming: accumulate ALL audio and emit periodically
+            if self._streaming_enabled and self._on_chunk_ready:
+                self._chunk_buffer.append(audio_chunk)
+                self._chunk_samples += len(audio_chunk)
+
+                # Emit CUMULATIVE audio when interval reached
+                if self._chunk_samples >= self._samples_per_chunk:
+                    # Get ALL audio recorded so far (from chunk_buffer which has everything)
+                    if self._chunk_buffer:
+                        cumulative_audio = np.concatenate(self._chunk_buffer)
+                    else:
+                        cumulative_audio = np.array([], dtype=np.float32)
+
+                    # Reset chunk counter but KEEP the chunk_buffer for cumulative
+                    self._chunk_samples = 0
+
+                    # Call chunk callback with cumulative audio
+                    if len(cumulative_audio) > 0:
+                        threading.Thread(
+                            target=self._on_chunk_ready,
+                            args=(cumulative_audio,),
+                            daemon=True,
+                        ).start()
+
     def start_recording(self):
         """Start capturing audio from microphone."""
         if self._is_recording:
@@ -101,6 +135,10 @@ class AudioCapture:
                     self._audio_queue.get_nowait()
                 except queue.Empty:
                     break
+
+            # Clear streaming buffer
+            self._chunk_buffer = []
+            self._chunk_samples = 0
 
             # Start stream
             try:
@@ -200,6 +238,31 @@ class AudioCapture:
             callback: Function called with audio level (0.0 - 1.0)
         """
         self._on_audio_level = callback
+
+    def set_chunk_callback(self, callback: Optional[Callable[[np.ndarray], None]]):
+        """Set callback for streaming audio chunks.
+
+        When set and streaming is enabled, this callback is called every
+        chunk_duration seconds with accumulated audio data.
+
+        Args:
+            callback: Function called with audio chunk (numpy array)
+        """
+        self._on_chunk_ready = callback
+
+    def enable_streaming(self, enabled: bool = True):
+        """Enable or disable streaming mode.
+
+        When enabled, audio chunks are emitted during recording.
+
+        Args:
+            enabled: Whether to enable streaming
+        """
+        self._streaming_enabled = enabled
+        if enabled:
+            self._chunk_buffer = []
+            self._chunk_samples = 0
+        logger.debug(f"Streaming {'enabled' if enabled else 'disabled'}")
 
     @staticmethod
     def get_input_devices() -> List[Dict]:

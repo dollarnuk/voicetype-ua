@@ -10,15 +10,18 @@ APP_VERSION = "0.1.0"
 # Paths
 APP_DIR = Path(__file__).parent.parent.parent
 CONFIG_FILE = APP_DIR / "config.json"
-DEFAULT_CONFIG_FILE = APP_DIR / "config_default.json"
+CONFIG_DEFAULT_FILE = APP_DIR / "config_default.json"
 MODELS_DIR = APP_DIR / "models"
 DATA_DIR = APP_DIR / "data"
 LOGS_DIR = APP_DIR / "logs"
 
-# Ensure directories exist
-MODELS_DIR.mkdir(exist_ok=True)
-DATA_DIR.mkdir(exist_ok=True)
-LOGS_DIR.mkdir(exist_ok=True)
+# Ensure directories exist (may fail in PyInstaller environment)
+try:
+    MODELS_DIR.mkdir(exist_ok=True)
+    DATA_DIR.mkdir(exist_ok=True)
+    LOGS_DIR.mkdir(exist_ok=True)
+except Exception:
+    pass
 
 # Audio settings
 DEFAULT_SAMPLE_RATE = 16000
@@ -44,7 +47,7 @@ SUPPORTED_LANGUAGES = {
 
 # Default hotkeys
 DEFAULT_HOTKEYS = {
-    "push_to_talk": ["ctrl", "shift", "space"],
+    "push_to_talk": ["ctrl", "space"],
     "toggle_language": ["ctrl", "shift", "l"],
     "open_settings": ["ctrl", "shift", ","],
     "open_history": ["ctrl", "shift", "h"],
