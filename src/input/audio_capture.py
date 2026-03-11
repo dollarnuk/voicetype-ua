@@ -104,20 +104,21 @@ class AudioCapture:
 
                 # Emit CUMULATIVE audio when interval reached
                 if self._chunk_samples >= self._samples_per_chunk:
-                    # Get ALL audio recorded so far (from chunk_buffer which has everything)
+                    # Get latest chunk from the buffer
                     if self._chunk_buffer:
-                        cumulative_audio = np.concatenate(self._chunk_buffer)
+                        chunk_to_send = np.concatenate(self._chunk_buffer)
                     else:
-                        cumulative_audio = np.array([], dtype=np.float32)
+                        chunk_to_send = np.array([], dtype=np.float32)
 
-                    # Reset chunk counter but KEEP the chunk_buffer for cumulative
+                    # Reset chunk buffer to send ONLY new audio in next call
+                    self._chunk_buffer = []
                     self._chunk_samples = 0
 
-                    # Call chunk callback with cumulative audio
-                    if len(cumulative_audio) > 0:
+                    # Call chunk callback
+                    if len(chunk_to_send) > 0:
                         threading.Thread(
                             target=self._on_chunk_ready,
-                            args=(cumulative_audio,),
+                            args=(chunk_to_send,),
                             daemon=True,
                         ).start()
 

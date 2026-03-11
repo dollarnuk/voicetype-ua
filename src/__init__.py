@@ -1,4 +1,4 @@
-"""VoiceType UA - Desktop application for voice-to-text input."""
+"""CORE - Desktop application for voice-to-text input."""
 
-__version__ = "0.1.0"
-__author__ = "VoiceType UA Team"
+__version__ = "0.2.0"
+__author__ = "CORE Team"

@@ -1,4 +1,4 @@
-"""Push-to-Talk controller - manages voice recording with hotkey."""
+"""Toggle controller - Push-On/Push-Off mode for voice recording."""
 
 from typing import Callable, Optional, Set
 import threading
@@ -16,24 +16,22 @@ from .hotkey_manager import HotkeyManager
 from .audio_capture import AudioCapture
 
 
-class PTTController:
-    """Push-to-Talk controller for voice input.
+class ToggleController:
+    """Toggle controller for voice input.
 
-    Handles the hold-to-record mechanism:
-    - Press hotkey: start recording
-    - Hold: continue recording
-    - Release: stop recording and transcribe
+    Handles the push-on/push-off recording mechanism:
+    - First hotkey press: start recording
+    - Second hotkey press: stop recording and transcribe
+
+    Unlike PTTController (hold-to-record), this uses a toggle approach
+    where each press flips the recording state.
 
     Attributes:
-        hotkey: The push-to-talk hotkey string
-        min_hold_time: Minimum hold time to register as PTT (not tap)
+        hotkey: The toggle hotkey string
     """
 
-    # Minimum time (seconds) to consider it a "hold" vs a "tap"
-    MIN_HOLD_TIME = 0.15
-
-    # Debounce window in milliseconds
-    DEBOUNCE_MS = 100
+    # Debounce window in milliseconds (higher than PTT to prevent double-toggle)
+    DEBOUNCE_MS = 200
 
     # Key mapping for comparison
     MODIFIER_KEYS = {
@@ -48,26 +46,25 @@ class PTTController:
         audio_capture: AudioCapture,
         hotkey: str = "ctrl+space",
     ):
-        """Initialize PTT controller.
+        """Initialize Toggle controller.
 
         Args:
             hotkey_manager: HotkeyManager instance
             audio_capture: AudioCapture instance
-            hotkey: Push-to-talk hotkey string
+            hotkey: Toggle hotkey string
         """
         self.hotkey_manager = hotkey_manager
         self.audio_capture = audio_capture
         self.hotkey = hotkey
 
         self._is_active = False
-        self._press_time: Optional[float] = None
+        self._is_recording = False
         self._ptt_keys: Set = set()
         self._current_keys: Set = set()
         self._lock = threading.Lock()
 
-        # Debounce state to prevent rapid fire
-        self._last_activation_time: float = 0
-        self._combo_was_active: bool = False
+        # Debounce state to prevent rapid toggling
+        self._last_toggle_time: float = 0
 
         # Callbacks
         self._on_recording_start: Optional[Callable] = None
@@ -82,14 +79,15 @@ class PTTController:
 
         # Streaming mode
         self._streaming_enabled: bool = False
+        self._streaming_text: str = ""  # Accumulated text during streaming
 
         # Parse hotkey
         self._parse_ptt_hotkey()
 
-        logger.info(f"PTTController initialized with hotkey: {hotkey}")
+        logger.info(f"ToggleController initialized with hotkey: {hotkey}")
 
     def _parse_ptt_hotkey(self):
-        """Parse the PTT hotkey string into key set."""
+        """Parse the toggle hotkey string into key set."""
         parts = self.hotkey.lower().replace(" ", "").split("+")
 
         for part in parts:
@@ -98,10 +96,13 @@ class PTTController:
             elif len(part) == 1:
                 self._ptt_keys.add(KeyCode.from_char(part))
 
-        logger.debug(f"PTT keys parsed: {self._ptt_keys}")
+        logger.debug(f"Toggle keys parsed: {self._ptt_keys}")
 
     def _normalize_key(self, key) -> Optional:
-        """Normalize key for comparison."""
+        """Normalize key for comparison.
+
+        Maps left/right variants of modifier keys to a single canonical form.
+        """
         if isinstance(key, Key):
             if key in (Key.ctrl_l, Key.ctrl_r):
                 return Key.ctrl_l
@@ -117,65 +118,62 @@ class PTTController:
         return None
 
     def _on_key_press(self, key):
-        """Handle key press for PTT."""
+        """Handle key press for toggle.
+
+        On each valid hotkey combo press, flip the recording state:
+        - If not recording -> start recording
+        - If recording -> stop recording and transcribe
+        """
         normalized = self._normalize_key(key)
         if normalized is None:
             return
 
         self._current_keys.add(normalized)
 
-        # Check if PTT combo is pressed
+        # Check if toggle combo is pressed
         if self._ptt_keys.issubset(self._current_keys):
             with self._lock:
                 now = time.time()
-                # Only trigger if:
-                # 1. Combo was NOT already active (prevents re-trigger)
-                # 2. Debounce period has passed
-                if not self._combo_was_active and (now - self._last_activation_time) >= self.DEBOUNCE_MS / 1000:
-                    self._combo_was_active = True
-                    self._last_activation_time = now
+                elapsed_ms = (now - self._last_toggle_time) * 1000
+
+                # Debounce: ignore if too soon after last toggle
+                if elapsed_ms < self.DEBOUNCE_MS:
+                    return
+
+                self._last_toggle_time = now
+
+                if not self._is_recording:
+                    # Toggle ON: start recording
+                    self._is_recording = True
                     self._is_active = True
-                    self._press_time = now
                     self._start_recording()
+                else:
+                    # Toggle OFF: stop recording and transcribe
+                    self._is_recording = False
+                    self._is_active = False
+                    self._stop_recording()
 
     def _on_key_release(self, key):
-        """Handle key release for PTT."""
+        """Handle key release — only used for tracking current keys.
+
+        Toggle mode does not use release to stop recording; it uses
+        the next press instead.
+        """
         normalized = self._normalize_key(key)
         if normalized is None:
             return
-
-        # Check if released key is part of PTT combo
-        if normalized in self._ptt_keys:
-            with self._lock:
-                # Only stop if combo was active and we're recording
-                if self._combo_was_active and self._is_active:
-                    hold_time = time.time() - self._press_time if self._press_time else 0
-
-                    if hold_time >= self.MIN_HOLD_TIME:
-                        # Valid PTT - stop and transcribe
-                        self._stop_recording()
-                    else:
-                        # Too short - cancel
-                        logger.debug(f"PTT cancelled (too short: {hold_time:.3f}s)")
-                        self._cancel_recording()
-
-                    self._is_active = False
-                    self._press_time = None
-
-                # Reset combo active flag when ANY PTT key is released
-                self._combo_was_active = False
 
         self._current_keys.discard(normalized)
 
     def _start_recording(self):
         """Start audio recording."""
-        logger.info("PTT: Recording started")
+        logger.info("Toggle: Recording started")
 
         try:
             # Clear streaming state
             self._streaming_text = ""
 
-            # Вмикаємо передачу чанків аудіо, якщо стрімінг активовано
+            # Set streaming chunk callback if streaming enabled
             if self._streaming_enabled:
                 self.audio_capture.set_chunk_callback(self._on_audio_chunk)
 
@@ -186,6 +184,9 @@ class PTTController:
 
         except Exception as e:
             logger.error(f"Failed to start recording: {e}")
+            # Reset state on failure
+            self._is_recording = False
+            self._is_active = False
 
     def _on_audio_chunk(self, audio_chunk):
         """Handle streaming audio chunk.
@@ -200,7 +201,7 @@ class PTTController:
 
     def _stop_recording(self):
         """Stop recording and trigger transcription."""
-        logger.info("PTT: Recording stopped")
+        logger.info("Toggle: Recording stopped")
 
         try:
             audio_data = self.audio_capture.stop_recording()
@@ -226,11 +227,14 @@ class PTTController:
 
     def _cancel_recording(self):
         """Cancel recording without transcription."""
-        logger.debug("PTT: Recording cancelled")
+        logger.debug("Toggle: Recording cancelled")
 
         try:
             if self.audio_capture.is_recording:
                 self.audio_capture.stop_recording()
+
+            # Clear chunk callback
+            self.audio_capture.set_chunk_callback(None)
 
             if self._on_recording_stop:
                 self._on_recording_stop()
@@ -245,7 +249,7 @@ class PTTController:
         on_transcription_ready: Optional[Callable] = None,
         on_streaming_text: Optional[Callable[[str], None]] = None,
     ):
-        """Set PTT event callbacks.
+        """Set toggle event callbacks.
 
         Args:
             on_recording_start: Called when recording starts
@@ -272,7 +276,7 @@ class PTTController:
 
     def _transcription_worker(self):
         """Worker thread that processes transcription queue."""
-        logger.info("Transcription worker started")
+        logger.info("Toggle transcription worker started")
         while self._worker_running:
             try:
                 # Wait for audio data with timeout (allows checking _worker_running)
@@ -286,18 +290,20 @@ class PTTController:
                     item_type, audio_data = item
 
                     if item_type == "chunk" and self._on_streaming_text:
-                        # Передаємо чанк аудіо далі (наприклад, у Deepgram WebSocket)
+                        # Streaming chunk - call streaming callback
                         try:
-                            self._on_streaming_text(audio_data)
+                            self._on_streaming_text(audio_data, self._streaming_text)
                         except Exception as e:
                             logger.error(f"Streaming callback error: {e}")
 
                     elif item_type == "final" and self._on_streaming_text:
-                        # Фінальний шматок аудіо після відпускання клавіші
+                        # Final chunk after toggle off - signal completion
                         try:
-                            self._on_streaming_text(audio_data, is_final=True)
+                            self._on_streaming_text(audio_data, self._streaming_text, is_final=True)
                         except Exception as e:
                             logger.error(f"Final streaming callback error: {e}")
+                        # Clear streaming text
+                        self._streaming_text = ""
 
                     elif item_type == "full" and self._on_transcription_ready:
                         # Full audio (non-streaming mode)
@@ -318,20 +324,20 @@ class PTTController:
                 continue
             except Exception as e:
                 logger.error(f"Transcription worker error: {e}")
-        logger.info("Transcription worker stopped")
+        logger.info("Toggle transcription worker stopped")
 
     def start(self):
-        """Start PTT controller."""
+        """Start toggle controller."""
         # Start transcription worker thread
         self._worker_running = True
         self._worker_thread = threading.Thread(
             target=self._transcription_worker,
             daemon=True,
-            name="TranscriptionWorker",
+            name="ToggleTranscriptionWorker",
         )
         self._worker_thread.start()
 
-        # Set key callbacks on hotkey manager
+        # Set key callbacks on hotkey manager (need release too for key tracking)
         self.hotkey_manager.set_key_callbacks(
             on_press=self._on_key_press,
             on_release=self._on_key_release,
@@ -340,10 +346,10 @@ class PTTController:
         if not self.hotkey_manager.is_running:
             self.hotkey_manager.start()
 
-        logger.info("PTTController started")
+        logger.info("ToggleController started")
 
     def stop(self):
-        """Stop PTT controller."""
+        """Stop toggle controller."""
         # Stop transcription worker
         self._worker_running = False
         if self._worker_thread and self._worker_thread.is_alive():
@@ -352,16 +358,18 @@ class PTTController:
         # Clear callbacks
         self.hotkey_manager.set_key_callbacks(None, None)
 
-        if self._is_active:
+        # Cancel any in-progress recording
+        if self._is_recording:
             self._cancel_recording()
 
+        self._is_recording = False
         self._is_active = False
         self._current_keys.clear()
 
-        logger.info("PTTController stopped")
+        logger.info("ToggleController stopped")
 
     def set_hotkey(self, hotkey: str):
-        """Change the PTT hotkey.
+        """Change the toggle hotkey.
 
         Args:
             hotkey: New hotkey string
@@ -369,14 +377,14 @@ class PTTController:
         self.hotkey = hotkey
         self._ptt_keys.clear()
         self._parse_ptt_hotkey()
-        logger.info(f"PTT hotkey changed to: {hotkey}")
+        logger.info(f"Toggle hotkey changed to: {hotkey}")
 
     @property
     def is_recording(self) -> bool:
         """Check if currently recording."""
-        return self._is_active
+        return self._is_recording
 
     @property
     def is_active(self) -> bool:
-        """Check if PTT is active."""
+        """Check if toggle controller is active (same as is_recording)."""
         return self._is_active

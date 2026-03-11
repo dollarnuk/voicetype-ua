@@ -1,4 +1,4 @@
-"""System tray application - PyQt6 GUI for VoiceType UA."""
+"""System tray application - PyQt6 GUI for CORE."""
 
 import sys
 from typing import Optional
@@ -22,14 +22,24 @@ except ImportError:
 
 from utils.constants import APP_NAME, APP_VERSION, Status
 from utils.logger import setup_logger
-from core.transcriber import Transcriber
-from core.hypothesis_buffer import HypothesisBuffer
+from utils.metrics import MetricsCollector
+from engine.transcriber import Transcriber
+from engine.text_processor import TextProcessor
+from engine.dictionary import Dictionary
 from input.audio_capture import AudioCapture
 from input.hotkey_manager import HotkeyManager
 from input.ptt_controller import PTTController
+from input.toggle_controller import ToggleController
 from output.text_inserter import TextInserter
 from data.config_manager import ConfigManager
 from data.history_storage import HistoryStorage
+from ui.theme import ThemeManager
+from ui.overlay_widget import RecordingOverlay
+from ui.sound_player import SoundPlayer
+from ui.settings_dialog import SettingsDialog
+from ui.history_window import HistoryWindow
+from ui.styles import MAIN_STYLE
+from utils import os_utils
 
 
 class SignalEmitter(QObject):
@@ -38,10 +48,12 @@ class SignalEmitter(QObject):
     status_changed = pyqtSignal(str)
     transcription_complete = pyqtSignal(str)
     error_occurred = pyqtSignal(str)
+    audio_level_changed = pyqtSignal(float)
+    deepgram_text_ready = pyqtSignal(str, bool)  # text, is_final
 
 
 class TrayApp(QApplication):
-    """System tray application for VoiceType UA.
+    """System tray application for CORE.
 
     Runs in the background with system tray icon.
     Provides access to settings, history, and status.
@@ -75,9 +87,19 @@ class TrayApp(QApplication):
         # Load configuration
         self.config = ConfigManager()
 
+        # Theme
+        theme_name = self.config.get("ui.theme", "dark")
+        self.theme = ThemeManager(theme_name)
+        self.theme.apply(self)
+        self.setStyleSheet(MAIN_STYLE)
+
         # State
         self._status = Status.IDLE
         self._current_language = self.config.get("general.language", "uk")
+
+        # Tray icon pulse timer (for recording animation)
+        self._tray_pulse_timer = None
+        self._tray_pulse_state = False
 
         # Initialize components
         self._init_components()
@@ -95,11 +117,11 @@ class TrayApp(QApplication):
             chunk_duration=self.config.get("transcription.chunk_duration", 1.5),
         )
 
-        # Transcriber (lazy load model)
+        # Transcriber (API based)
         self.transcriber = Transcriber(
-            model_size=self.config.get("transcription.model_size", "base"),
-            device=self.config.get("transcription.device", "auto"),
-            compute_type=self.config.get("transcription.compute_type", "int8"),
+            api_key=self.config.get("transcription.deepgram_api_key", ""),
+            model=self.config.get("transcription.deepgram_model", "nova-2-general"),
+            language=self._current_language,
         )
 
         # Text inserter
@@ -110,15 +132,27 @@ class TrayApp(QApplication):
         # Hotkey manager
         self.hotkey_manager = HotkeyManager()
 
-        # PTT controller
-        self.ptt_controller = PTTController(
-            hotkey_manager=self.hotkey_manager,
-            audio_capture=self.audio_capture,
-            hotkey=self.config.get("hotkeys.push_to_talk", "ctrl+space"),
-        )
+        # Input controller (PTT or Toggle based on config)
+        input_mode = self.config.get("hotkeys.input_mode", "ptt")
+        hotkey = self.config.get("hotkeys.push_to_talk", "ctrl+space")
+
+        if input_mode == "toggle":
+            self.controller = ToggleController(
+                hotkey_manager=self.hotkey_manager,
+                audio_capture=self.audio_capture,
+                hotkey=hotkey,
+            )
+            logger.info("Using Toggle input mode")
+        else:
+            self.controller = PTTController(
+                hotkey_manager=self.hotkey_manager,
+                audio_capture=self.audio_capture,
+                hotkey=hotkey,
+            )
+            logger.info("Using PTT input mode")
 
         # Set callbacks
-        self.ptt_controller.set_callbacks(
+        self.controller.set_callbacks(
             on_recording_start=self._on_recording_start,
             on_recording_stop=self._on_recording_stop,
             on_transcription_ready=self._on_transcription_ready,
@@ -126,9 +160,8 @@ class TrayApp(QApplication):
         )
 
         # Enable streaming mode if configured
-        streaming_enabled = self.config.get("transcription.streaming", True)
-        if streaming_enabled:
-            self.ptt_controller.enable_streaming(True)
+        if self.config.get("transcription.streaming", True):
+            self.controller.enable_streaming(True)
             logger.info("Streaming mode enabled")
 
         # Register language toggle
@@ -137,26 +170,48 @@ class TrayApp(QApplication):
             self._toggle_language,
         )
 
+        # Connect audio level callback to signal
+        self.audio_capture.set_audio_level_callback(
+            lambda level: self.signals.audio_level_changed.emit(level)
+        )
+
         # History storage
         self.history = HistoryStorage()
 
-        # LocalAgreement-2 buffer for streaming
-        self._hypothesis_buffer = HypothesisBuffer()
+        # Dictionary + Text processor
+        self.dictionary = Dictionary()
+        self.text_processor = TextProcessor(
+            capitalize=self.config.get("output.capitalize_sentences", True),
+            auto_punctuation=self.config.get("output.auto_punctuation", True),
+            dictionary=self.dictionary if self.config.get("output.dictionary_enabled", True) else None,
+        )
+
+        # Metrics collector
+        self.metrics = MetricsCollector()
+
+        # Потоковий текст від Deepgram
+        self._current_streaming_text = ""
+
+        # Settings/History windows (lazy)
+        self._settings_dialog = None
+        self._history_window = None
+
+        # Overlay widget
+        self._overlay = RecordingOverlay(self.theme.colors)
+        self.signals.audio_level_changed.connect(self._overlay.update_audio_level)
+
+        # Sound player
+        self.sound_player = SoundPlayer(
+            enabled=self.config.get("ui.play_sounds", True)
+        )
 
     def _init_tray(self):
         """Initialize system tray icon and menu."""
         # Create tray icon
         self.tray_icon = QSystemTrayIcon(self)
 
-        # Set icon (use default for now)
-        icon_path = Path(__file__).parent / "resources" / "icons" / "tray_idle.png"
-        if icon_path.exists():
-            self.tray_icon.setIcon(QIcon(str(icon_path)))
-        else:
-            # Use application default icon
-            self.tray_icon.setIcon(self.style().standardIcon(
-                self.style().StandardPixmap.SP_MediaVolume
-            ))
+        # Set icon using theme manager
+        self.tray_icon.setIcon(self.theme.get_tray_icon(Status.IDLE))
 
         # Create menu
         menu = QMenu()
@@ -216,7 +271,11 @@ class TrayApp(QApplication):
         QTimer.singleShot(100, self._load_model)
 
         # Start PTT
-        self.ptt_controller.start()
+        self.controller.start()
+        
+        # Ensure autostart registry matches config
+        autostart_enabled = self.config.get("general.start_with_windows", False)
+        os_utils.set_autostart(autostart_enabled)
 
         logger.info("Application started")
 
@@ -235,16 +294,32 @@ class TrayApp(QApplication):
 
     def _on_recording_start(self):
         """Called when recording starts."""
-        # Reset hypothesis buffer for new recording
-        self._hypothesis_buffer.reset()
 
         self._set_status(Status.RECORDING)
         self.tray_icon.setToolTip(f"{APP_NAME}\nЗапис...")
+
+        # Show overlay and play sound
+        if self.config.get("ui.show_status_indicator", True):
+            self._overlay.show_recording(self._current_language)
+        self.sound_player.play("record_start")
+
+        # Запуск WebSocket сесії Deepgram при старті запису
+        if self.config.get("transcription.streaming", True):
+            self._current_streaming_text = ""
+            self.transcriber.start_streaming(
+                callback=self._on_deepgram_message,
+                language=self._current_language
+            )
 
     def _on_recording_stop(self):
         """Called when recording stops."""
         self._set_status(Status.PROCESSING)
         self.tray_icon.setToolTip(f"{APP_NAME}\nОбробка...")
+
+        # Update overlay to processing state
+        if self.config.get("ui.show_status_indicator", True):
+            self._overlay.show_processing()
+        self.sound_player.play("record_stop")
 
     def _on_transcription_ready(self, audio_data):
         """Process transcription (called from worker thread)."""
@@ -252,10 +327,12 @@ class TrayApp(QApplication):
             text, confidence = self.transcriber.transcribe(
                 audio_data,
                 language=self._current_language,
-                beam_size=self.config.get("transcription.beam_size", 5),
             )
 
             if text:
+                # Apply text processing pipeline
+                text = self.text_processor.process(text, language=self._current_language)
+
                 # Wait for user to release all keys
                 import time
                 time.sleep(0.3)
@@ -279,81 +356,74 @@ class TrayApp(QApplication):
 
             self._set_status(Status.IDLE)
             self.tray_icon.setToolTip(f"{APP_NAME}\nГотовий до запису")
+            self._overlay.hide_recording()
 
         except Exception as e:
             logger.error(f"Transcription error: {e}")
             self.signals.error_occurred.emit(str(e))
             self._set_status(Status.ERROR)
+            self._overlay.hide_recording()
+            self.sound_player.play("error")
 
-    def _on_streaming_text(self, audio_data, previous_text: str = "", is_final: bool = False):
-        """Handle streaming audio chunk with LocalAgreement-2.
+    def _on_streaming_text(self, audio_chunk, is_final: bool = False):
+        """Обробка чанку аудіо для Deepgram стрімінгу."""
+        if not is_final:
+            self.transcriber.send_audio_chunk(audio_chunk)
+        else:
+            # Завершуємо WebSocket сесію
+            self.transcriber.stop_streaming()
+            
+            # Save full text to history if any
+            full_text = self._current_streaming_text.strip()
+            if full_text:
+                self.history.add_entry(
+                    text=full_text,
+                    language=self._current_language,
+                    duration_ms=0, # Could calculate from chunks
+                    confidence=0.9,
+                )
+                self.signals.transcription_complete.emit(full_text)
+                self._current_streaming_text = ""
 
-        Uses HypothesisBuffer to confirm words only when 2 consecutive
-        transcriptions agree on them.
+            self._set_status(Status.IDLE)
+            self.tray_icon.setToolTip(f"{APP_NAME}\nГотовий до запису")
+            self._overlay.hide_recording()
 
-        Args:
-            audio_data: Cumulative audio from start of recording
-            previous_text: Previously confirmed and inserted text
-            is_final: Whether this is the final chunk after PTT release
+    def _on_deepgram_message(self, text: str, is_final: bool):
+        """Коллбек від Transcriber при отриманні тексту від Deepgram.
+        
+        УВАГА: Цей метод викликається з ФОНОВОГО потоку Deepgram WebSocket!
+        Не можна напряму симулювати клавіші — Windows ігнорує SendInput з фонових потоків.
+        Використовуємо QTimer.singleShot(0) для гарантованого виконання в головному потоці Qt.
+        """
+        if not text:
+            return
+
+        logger.info(f"Received from Deepgram (bg thread): '{text}' (final={is_final})")
+        
+        # QTimer.singleShot(0, fn) — гарантовано виконається в головному потоці Qt event loop
+        from functools import partial
+        QTimer.singleShot(0, partial(self._insert_text_on_main_thread, text, is_final))
+
+    def _insert_text_on_main_thread(self, text: str, is_final: bool):
+        """Вставка тексту в ГОЛОВНОМУ потоці Qt (викликається через QTimer.singleShot).
+        
+        Тут безпечно симулювати клавіші через pyautogui/pynput.
         """
         try:
-            # Transcribe with word-level timestamps (required for LocalAgreement-2)
-            words = self.transcriber.transcribe_chunk_with_timestamps(
-                audio_data,
-                language=self._current_language,
-            )
-
-            if words:
-                # Insert words into hypothesis buffer (offset=0 since audio is cumulative)
-                self._hypothesis_buffer.insert(words, offset=0)
-
-                # Confirm words where buffer and new agree
-                confirmed = self._hypothesis_buffer.flush()
-
-                if confirmed:
-                    # Insert only NEWLY confirmed words
-                    new_text = " ".join([w[2] for w in confirmed])
-                    use_space = bool(previous_text) and not new_text.startswith(" ")
-                    self.text_inserter.append_text(new_text, use_space=use_space)
-
-                    # Update streaming text with all confirmed text
-                    self.ptt_controller._streaming_text = self._hypothesis_buffer.get_confirmed_text()
-
-                    logger.debug(f"Streaming confirmed: '{new_text}' (total: {len(self._hypothesis_buffer)} words)")
-
+            # Обробка тексту
+            processed_text = self.text_processor.process_streaming(text, self._current_language)
+            
             if is_final:
-                # Finalize remaining words in buffer
-                finalized = self._hypothesis_buffer.finalize()
-                if finalized:
-                    final_text = " ".join([w[2] for w in finalized])
-                    use_space = bool(self.ptt_controller._streaming_text)
-                    self.text_inserter.append_text(final_text, use_space=use_space)
-                    self.ptt_controller._streaming_text += (" " + final_text if use_space else final_text)
-                    logger.debug(f"Streaming finalized: '{final_text}'")
-
-                # Save full text to history
-                full_text_final = self.ptt_controller._streaming_text.strip()
-                if full_text_final:
-                    duration_ms = int(len(audio_data) / 16000 * 1000)
-                    self.history.add_entry(
-                        text=full_text_final,
-                        language=self._current_language,
-                        duration_ms=duration_ms,
-                        confidence=0.8,  # Default confidence for streaming
-                    )
-                    self.signals.transcription_complete.emit(full_text_final)
-
-                # Reset hypothesis buffer for next recording
-                self._hypothesis_buffer.reset()
-
-                self._set_status(Status.IDLE)
-                self.tray_icon.setToolTip(f"{APP_NAME}\nГотовий до запису")
-
+                use_space = bool(self._current_streaming_text)
+                self.text_inserter.append_text(processed_text, use_space=use_space)
+                self._current_streaming_text += (" " + processed_text if use_space else processed_text)
+                logger.info(f"✅ Text inserted on MAIN thread: '{processed_text}'")
+            else:
+                logger.debug(f"Deepgram interim: '{processed_text}'")
         except Exception as e:
-            logger.error(f"Streaming transcription error: {e}")
-            if is_final:
-                self._hypothesis_buffer.reset()
-                self._set_status(Status.IDLE)
+            logger.error(f"Error inserting text on main thread: {e}")
+
 
     def _get_new_text(self, previous: str, current: str) -> str:
         """Get only the new text that wasn't in previous transcription.
@@ -416,7 +486,31 @@ class TrayApp(QApplication):
     def _set_status(self, status: str):
         """Set current status."""
         self._status = status
+        self._update_tray_icon(status)
         self.signals.status_changed.emit(status)
+
+    def _update_tray_icon(self, status: str):
+        """Update tray icon based on status and manage pulse animation."""
+        self.tray_icon.setIcon(self.theme.get_tray_icon(status))
+
+        # Start/stop pulse animation for recording
+        if status == Status.RECORDING:
+            if self._tray_pulse_timer is None:
+                self._tray_pulse_timer = QTimer(self)
+                self._tray_pulse_timer.timeout.connect(self._pulse_tray_icon)
+            self._tray_pulse_timer.start(600)
+        else:
+            if self._tray_pulse_timer is not None:
+                self._tray_pulse_timer.stop()
+            self._tray_pulse_state = False
+
+    def _pulse_tray_icon(self):
+        """Alternate tray icon for pulsing recording indicator."""
+        self._tray_pulse_state = not self._tray_pulse_state
+        if self._tray_pulse_state:
+            self.tray_icon.setIcon(self.theme.get_recording_icon_alt())
+        else:
+            self.tray_icon.setIcon(self.theme.get_tray_icon(Status.RECORDING))
 
     def _on_status_changed(self, status: str):
         """Handle status change (UI thread)."""
@@ -455,30 +549,36 @@ class TrayApp(QApplication):
 
     def _show_settings(self):
         """Show settings dialog."""
-        # TODO: Implement settings dialog
-        QMessageBox.information(
-            None,
-            "Налаштування",
-            "Вікно налаштувань буде додано пізніше.\n\n"
-            f"Push-to-talk: {self.config.get('hotkeys.push_to_talk')}\n"
-            f"Перемикання мови: {self.config.get('hotkeys.toggle_language')}\n"
-            f"Модель: {self.config.get('transcription.model_size')}",
-        )
+        if self._settings_dialog is None:
+            self._settings_dialog = SettingsDialog(
+                config_manager=self.config,
+                audio_capture=self.audio_capture,
+            )
+            self._settings_dialog.settings_changed.connect(self._on_settings_changed)
+        self._settings_dialog.exec()
+
+    def _on_settings_changed(self):
+        """Apply changed settings without full restart."""
+        # Update sound player
+        self.sound_player.enabled = self.config.get("ui.play_sounds", True)
+
+        # Update text processor
+        self.text_processor._capitalize = self.config.get("output.capitalize_sentences", True)
+        self.text_processor._auto_punctuation = self.config.get("output.auto_punctuation", True)
+
+        # Update autostart
+        autostart_enabled = self.config.get("general.start_with_windows", False)
+        os_utils.set_autostart(autostart_enabled)
+
+        logger.info("Settings applied")
 
     def _show_history(self):
         """Show history window."""
-        # TODO: Implement history window
-        entries = self.history.get_entries(limit=10)
-        if entries:
-            text = "\n".join([f"- {e['text'][:50]}..." for e in entries])
-        else:
-            text = "Історія порожня"
-
-        QMessageBox.information(
-            None,
-            "Історія",
-            f"Останні записи:\n\n{text}",
-        )
+        if self._history_window is None:
+            self._history_window = HistoryWindow(history_storage=self.history)
+        self._history_window.show()
+        self._history_window.raise_()
+        self._history_window.activateWindow()
 
     def _show_about(self):
         """Show about dialog."""
@@ -488,7 +588,7 @@ class TrayApp(QApplication):
             f"<h3>{APP_NAME} v{APP_VERSION}</h3>"
             "<p>Голосовий набір тексту для Windows</p>"
             "<p>Підтримка української та англійської мов</p>"
-            "<p>Використовує faster-whisper для локальної обробки</p>"
+            "<p>Оптимізовано під Deepgram API для максимальної швидкості</p>"
             "<hr>"
             "<p><b>Гарячі клавіші:</b></p>"
             f"<p>Push-to-talk: {self.config.get('hotkeys.push_to_talk')}</p>"
@@ -500,7 +600,7 @@ class TrayApp(QApplication):
         logger.info("Quitting application...")
 
         # Stop PTT
-        self.ptt_controller.stop()
+        self.controller.stop()
         self.hotkey_manager.stop()
 
         # Unload model

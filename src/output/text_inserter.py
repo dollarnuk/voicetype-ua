@@ -61,8 +61,8 @@ class TextInserter:
         self.add_trailing_space = add_trailing_space
 
         self._keyboard = Controller()
-
-        logger.info("TextInserter initialized")
+        
+        logger.info(f"TextInserter initialized (pyautogui={PYAUTOGUI_AVAILABLE}, pynput={PYNPUT_AVAILABLE})")
 
     def insert_text(self, text: str) -> bool:
         """Insert text into the active window.
@@ -117,16 +117,19 @@ class TextInserter:
                     pass
 
             # Wait for user to physically release all keys
-            time.sleep(0.4)
+            time.sleep(0.3)
 
-            # Simulate Ctrl+V - use pyautogui if available (more reliable)
+            # Simulate Ctrl+V - use a more robust sequence
             if PYAUTOGUI_AVAILABLE:
-                pyautogui.hotkey('ctrl', 'v', interval=0.05)
+                pyautogui.keyDown('ctrl')
+                time.sleep(0.05)
+                pyautogui.press('v')
+                time.sleep(0.05)
+                pyautogui.keyUp('ctrl')
             else:
-                self._keyboard.press(Key.ctrl)
-                self._keyboard.press("v")
-                self._keyboard.release("v")
-                self._keyboard.release(Key.ctrl)
+                with self._keyboard.pressed(Key.ctrl):
+                    self._keyboard.press('v')
+                    self._keyboard.release('v')
 
             # Wait for paste to complete
             time.sleep(self.paste_delay)
@@ -139,7 +142,7 @@ class TextInserter:
                 except Exception:
                     pass
 
-            logger.info(f"Inserted text: '{text[:30]}...' ({len(text)} chars)")
+            logger.info(f"Inserted text: '{text[:30]}...' ({len(text)} chars) using {'pyautogui' if PYAUTOGUI_AVAILABLE else 'pynput'}")
             return True
 
         except Exception as e:
@@ -147,10 +150,9 @@ class TextInserter:
             return False
 
     def append_text(self, text: str, use_space: bool = True) -> bool:
-        """Append text during streaming (faster, no key release wait).
+        """Append text during streaming.
 
-        Optimized for real-time text insertion during PTT hold.
-        Doesn't wait for modifier key release since user is still holding PTT.
+        Uses clipboard + Ctrl+V via Win32 keybd_event for reliable insertion.
 
         Args:
             text: Text to append
@@ -169,26 +171,31 @@ class TextInserter:
 
             # Copy to clipboard
             pyperclip.copy(text)
-            time.sleep(0.02)  # Minimal delay
+            time.sleep(0.05)
 
-            # Quick paste using pyautogui (doesn't interfere with held keys)
-            if PYAUTOGUI_AVAILABLE:
-                # Release only Ctrl temporarily for paste
-                pyautogui.keyUp('ctrl')
-                time.sleep(0.05)
-                pyautogui.hotkey('ctrl', 'v', interval=0.02)
-            else:
-                # Fallback to pynput
-                self._keyboard.release(Key.ctrl)
-                self._keyboard.release(Key.ctrl_l)
-                self._keyboard.release(Key.ctrl_r)
-                time.sleep(0.05)
-                self._keyboard.press(Key.ctrl)
-                self._keyboard.press("v")
-                self._keyboard.release("v")
-                self._keyboard.release(Key.ctrl)
+            # Use Win32 keybd_event directly — more reliable than pyautogui
+            import ctypes
+            user32 = ctypes.windll.user32
 
-            logger.debug(f"Appended text: '{text[:20]}...'")
+            VK_CONTROL = 0x11
+            VK_V = 0x56
+            KEYEVENTF_KEYUP = 0x0002
+
+            # Release all modifier keys first
+            for vk in [0x11, 0x10, 0x12]:  # Ctrl, Shift, Alt
+                user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
+            time.sleep(0.05)
+
+            # Press Ctrl+V
+            user32.keybd_event(VK_CONTROL, 0, 0, 0)  # Ctrl down
+            time.sleep(0.02)
+            user32.keybd_event(VK_V, 0, 0, 0)  # V down
+            time.sleep(0.02)
+            user32.keybd_event(VK_V, 0, KEYEVENTF_KEYUP, 0)  # V up
+            time.sleep(0.02)
+            user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)  # Ctrl up
+
+            logger.info(f"Appended text: '{text[:20]}...' using Win32 keybd_event")
             return True
 
         except Exception as e:

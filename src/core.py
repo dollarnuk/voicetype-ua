@@ -1,7 +1,7 @@
-"""VoiceType UA - Main entry point.
+"""CORE - Main entry point.
 
 Voice-to-text application for Windows with Ukrainian language support.
-Analog of SuperWhisper using faster-whisper for local transcription.
+Використовує Deepgram API для швидкої та точної транскрипції.
 """
 
 import sys
@@ -15,7 +15,7 @@ from loguru import logger
 from utils.logger import setup_logger
 from utils.constants import APP_NAME, APP_VERSION
 
-from core.transcriber import Transcriber
+from engine.transcriber import Transcriber
 from input.audio_capture import AudioCapture
 from input.hotkey_manager import HotkeyManager
 from input.ptt_controller import PTTController
@@ -24,7 +24,7 @@ from data.config_manager import ConfigManager
 from data.history_storage import HistoryStorage
 
 
-class VoiceTypeApp:
+class COREApp:
     """Main application class.
 
     Coordinates all components for voice-to-text functionality.
@@ -44,12 +44,12 @@ class VoiceTypeApp:
         # Load configuration
         self.config = ConfigManager()
 
-        # Initialize components
-        self._init_components()
-
-        # State
+        # State (must be set before _init_components)
         self._is_running = False
         self._current_language = self.config.get("general.language", "uk")
+
+        # Initialize components
+        self._init_components()
 
         logger.info("Application initialized")
 
@@ -63,9 +63,9 @@ class VoiceTypeApp:
 
         # Transcriber
         self.transcriber = Transcriber(
-            model_size=self.config.get("transcription.model_size", "base"),
-            device=self.config.get("transcription.device", "auto"),
-            compute_type=self.config.get("transcription.compute_type", "int8"),
+            api_key=self.config.get("transcription.deepgram_api_key", ""),
+            model=self.config.get("transcription.deepgram_model", "nova-2-general"),
+            language=self._current_language,
         )
 
         # Text inserter
@@ -124,8 +124,6 @@ class VoiceTypeApp:
             text, confidence = self.transcriber.transcribe(
                 audio_data,
                 language=self._current_language,
-                beam_size=self.config.get("transcription.beam_size", 5),
-                vad_filter=self.config.get("transcription.vad_filter", True),
             )
 
             if text:
@@ -243,7 +241,7 @@ def main():
         return
 
     # Create and run application
-    app = VoiceTypeApp(debug=args.debug)
+    app = COREApp(debug=args.debug)
 
     if args.console:
         app.run_console()
@@ -289,7 +287,7 @@ def run_test():
     # Test transcription
     print("\n3. Transcribing (loading model)...")
     try:
-        transcriber = Transcriber(model_size="base", device="auto")
+        transcriber = Transcriber(api_key="TEST_KEY")
         transcriber.load_model()
 
         text, confidence = transcriber.transcribe(audio_data, language="uk")

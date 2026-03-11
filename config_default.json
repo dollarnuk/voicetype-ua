@@ -8,7 +8,8 @@
     "push_to_talk": "ctrl+space",
     "toggle_language": "ctrl+shift+l",
     "open_settings": "ctrl+shift+comma",
-    "open_history": "ctrl+shift+h"
+    "open_history": "ctrl+shift+h",
+    "input_mode": "ptt"
   },
   "audio": {
     "input_device": null,
@@ -18,21 +19,19 @@
     "silence_duration_ms": 500
   },
   "transcription": {
-    "model_size": "small",
-    "device": "cuda",
-    "compute_type": "int8",
-    "beam_size": 6,
-    "vad_filter": true,
-    "word_timestamps": false,
-    "initial_prompt": null,
+    "language": "uk",
+    "deepgram_api_key": "",
+    "deepgram_model": "nova-2-general",
     "streaming": true,
-    "chunk_duration": 1.5
+    "chunk_duration": 0.5
   },
   "output": {
     "insert_method": "clipboard",
     "add_trailing_space": true,
     "capitalize_sentences": true,
-    "preserve_clipboard": true
+    "auto_punctuation": true,
+    "preserve_clipboard": true,
+    "dictionary_enabled": true
   },
   "history": {
     "enabled": true,
@@ -40,8 +39,11 @@
     "save_audio": false
   },
   "ui": {
-    "theme": "system",
+    "theme": "dark",
+    "play_sounds": true,
     "show_status_indicator": true,
-    "notification_on_complete": false
+    "notification_on_complete": false,
+    "overlay_x": -1,
+    "overlay_y": -1
   }
 }
